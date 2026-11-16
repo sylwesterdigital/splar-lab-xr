@@ -52,9 +52,18 @@ def color(text, style):
     return f'{ANSI.get(style, ANSI["info"])}{text}{RESET}' if COLOR else text
 
 
+last_output_at = 0.0
+
+
 def log(message, style='info'):
+    global last_output_at
+    moment = time.monotonic()
+    # Separate real events visually; do not print anything during idle scans.
+    if last_output_at and moment - last_output_at > 1.0:
+        print(flush=True)
     clock = datetime.now().astimezone().strftime('%H:%M:%S')
     print(f'{color("[" + clock + "]", "scan")} {color("SPLAR", style)} | {message}', flush=True)
+    last_output_at = moment
 
 
 def local_ip():
@@ -470,8 +479,8 @@ def main():
     version_tuple(current_version())
     if not VERSION_FILE.exists():
         atomic_bytes(VERSION_FILE, b'0.1.0\n')
-    log(f'Watching {UPDATES} | current v{current_version()} | interval {POLL}s', 'deploy')
-    log('No pip reinstalls, model redownloads or SQLite changes')
+    log(f'Watching {UPDATES} | current v{current_version()} | interval {POLL}s (quiet)', 'deploy')
+    log('Only updates, errors and restarts are printed; no dependency or model reinstall')
     try:
         if migrate_legacy_port():
             if not health():
@@ -486,8 +495,10 @@ def main():
             stability[archive.name] = (archive.stat().st_size, archive.stat().st_mtime_ns)
     while True:
         try:
-            if not ONCE:
-                print()  # A blank line separates each refresh in the terminal.
+            # Watch quietly. Polling still happens on schedule but only meaningful
+            # events (releases, restarts, Git changes and errors) are logged.
+            # Optional SPLAR_VERBOSE_WATCH=1 restores per-poll output for debugging.
+            if not ONCE and os.getenv('SPLAR_VERBOSE_WATCH', '0') == '1':
                 log(f'Refresh • v{current_version()} • checking updates', 'scan')
             if not migrate_legacy_port():
                 if ONCE:

@@ -328,11 +328,15 @@ def reconstruct(scene_id):
         kept_radii = np.empty((0,), dtype=np.float32)
         kept_priority = np.empty((0,), dtype=np.float64)
         start = 0
+        batch_no = 0
+        step = BATCH_VIEWS - BATCH_OVERLAP
+        batch_total = 1 + max(0, math.ceil((total - BATCH_VIEWS) / step))
         while start < total:
+            batch_no += 1
             end = min(total, start + BATCH_VIEWS)
             ids = list(range(start, end))
             start_view = sum(i in anchors for i in ids)
-            set_scene(scene_id, stage=f'Reconstructing photos {start + 1}–{end} of {total}')
+            set_scene(scene_id, stage=f'Batch {batch_no}/{batch_total} · reconstructing photos {start + 1}–{end} of {total}')
             paths = [str(scene_path(scene_id) / rows[i]['path']) for i in ids]
             images = load_and_preprocess_images(paths).to(device)
             with torch.inference_mode():
@@ -346,7 +350,7 @@ def reconstruct(scene_id):
             rgb = (images.detach().float().cpu().numpy().transpose(0, 2, 3, 1) * 255).clip(0, 255).astype(np.uint8)
             del result, images
             if anchors:
-                set_scene(scene_id, stage=f'Aligning photos {start + 1}–{end} of {total}')
+                set_scene(scene_id, stage=f'Batch {batch_no}/{batch_total} · aligning photos {start + 1}–{end} of {total}')
                 points, world_scale = align_window(points, confidence, ids, anchors)
             else:
                 world_scale = 1.0
@@ -376,7 +380,7 @@ def reconstruct(scene_id):
         p, color, radius = kept_points, kept_colors, kept_radii
         if len(p) < 500:
             raise RuntimeError('Insufficient valid 3D points. Use overlapping, well-lit photos.')
-        set_scene(scene_id, stage='Building Gaussian splats')
+        set_scene(scene_id, stage=f'Building Gaussian splats from {total} photos')
         center = .5 * (np.quantile(p, .05, axis=0) + np.quantile(p, .95, axis=0))
         size = np.quantile(p, .95, axis=0) - np.quantile(p, .05, axis=0)
         scale = 6.6 / max(float(np.max(size)), .01)
@@ -625,7 +629,7 @@ INDEX_HTML = r'''<!doctype html>
  <span class="bar-sep"></span><button class="toolbtn" id="fitButton"><svg class="ico" viewBox="0 0 24 24"><path d="M8 3H3v5m18 0V3h-5M3 16v5h5m8 0h5v-5"/></svg>Fit</button>
  <span class="bar-sep"></span><button class="toolbtn" id="xrButton" disabled title="Requires a WebXR-compatible headset and secure context"><svg class="ico" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="11" rx="4"/><path d="M7 12h3m4 0h3"/></svg><span id="xrLabel">XR</span></button>
 </div>
-<div class="foot-note">SPLAR / LOCAL-FIRST SPATIAL WORKSPACE · <span id="appVersion">v0.3.0</span></div>
+<div class="foot-note">SPLAR / LOCAL-FIRST SPATIAL WORKSPACE · <span id="appVersion">v0.3.1</span></div>
 <div id="toast" role="status"></div>
 <div class="modal-backdrop" id="galleryModal" role="dialog" aria-modal="true" aria-label="Room gallery"><div class="modal"><div class="modal-top"><div><div class="modal-title">Your spaces<span style="color:var(--accent)">.</span></div><div class="modal-sub">Stored locally · SQLite</div></div><button class="modal-close" id="closeGallery" aria-label="Close gallery">×</button></div><div class="gallery" id="galleryGrid"></div></div></div>
 <script>
@@ -747,7 +751,7 @@ async function refreshScenes(){scenes=await api('/api/scenes');$('#galleryCount'
 async function setScene(s){scene=s;selectedId=s?.id||null;if(selectedId)localStorage.setItem('splar.scene',selectedId);else localStorage.removeItem('splar.scene');currentDemo=!s||s.status!=='ready';
  $('#photoCount').textContent=String(s?.images?.length||0);$('#inspectName').textContent=s?.title||'Demo room';$('#inspectViews').textContent=s?String(s.images.length):'—';$('#inspectMode').textContent=s?(s.status==='ready'?'Reconstructed':s.status==='processing'?'Processing':'Draft'):'Demo';
  $('#sceneTitle').textContent=s?.title||'The spatial canvas.';$('#sceneEyebrow').textContent=s?.status==='ready'?'RECONSTRUCTED 3D SCENE':s?.status==='processing'?'GENERATING GEOMETRY':'INTERACTIVE 3D PREVIEW';
- $('#sceneSubtitle').textContent=s?.status==='ready'?'Navigate your reconstructed space.':s?.status==='processing'?'Local geometry engine is running.':'Add overlapping photos to reconstruct your room.';
+ $('#sceneSubtitle').textContent=s?.status==='ready'?'Navigate your reconstructed space.':s?.status==='processing'?'Preview shown while your photos are being reconstructed.':'Add overlapping photos to reconstruct your room.';
  $('#sceneHeading').classList.toggle('condensed',!!s);
  const count=s?.images?.length||0;$('#processButton').disabled=count<2||s?.status==='processing';$('#processButton span').textContent=s?.status==='processing'?'Processing…':s?.status==='ready'?'Reprocess room':'Process room';
  $('#processLabel').textContent=s?.status==='error'?(s.error||'Processing failed'):s?.status==='processing'?s.stage:s?.status==='ready'?'3D scene is ready':count<2?'Add at least 2 overlapping images':`${count} photos ready`;
