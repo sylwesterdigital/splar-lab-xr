@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import shutil
 import signal
 import ssl
@@ -33,22 +34,64 @@ VERSION_FILE = ROOT / 'VERSION'
 PID_FILE = STATE / 'flask.pid'
 PENDING_FILE = STATE / 'pending.json'
 LOG_FILE = STATE / 'flask.log'
-PORT = int(os.getenv('SPLAR_PORT', '5050'))
+PORT = int(os.getenv('SPLAR_PORT', '5463'))
+BIND = os.getenv('SPLAR_BIND', '0.0.0.0')
 POLL = max(2, int(os.getenv('SPLAR_WATCH_INTERVAL', '4')))
 URL = ('https' if os.getenv('SPLAR_HTTPS') == '1' or os.getenv('SPLAR_CERT') else 'http') + f'://127.0.0.1:{PORT}'
 VERSION_RE = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')
 PY_SOURCE = 'core/splar.py'
 last_notice = {}
 last_publish_attempt = 0.0
+COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ and os.getenv('TERM') != 'dumb'
+ANSI = {'info':'\033[38;5;117m','scan':'\033[38;5;244m','ok':'\033[38;5;120m',
+        'warn':'\033[38;5;214m','error':'\033[38;5;203m','deploy':'\033[38;5;183m'}
+RESET = '\033[0m' if COLOR else ''
 
 
-def log(message):
-    print(f'[{datetime.now().astimezone().strftime("%H:%M:%S")}] SPLAR | {message}', flush=True)
+def color(text, style):
+    return f'{ANSI.get(style, ANSI["info"])}{text}{RESET}' if COLOR else text
+
+
+def log(message, style='info'):
+    clock = datetime.now().astimezone().strftime('%H:%M:%S')
+    print(f'{color("[" + clock + "]", "scan")} {color("SPLAR", style)} | {message}', flush=True)
+
+
+def local_ip():
+    # macOS: prefer active Wi-Fi / Ethernet interfaces without an external network request.
+    if sys.platform == 'darwin':
+        for interface in ('en0', 'en1', 'en2', 'en3', 'en4', 'en5', 'en6', 'en7'):
+            try:
+                value = subprocess.run(['ipconfig', 'getifaddr', interface], text=True,
+                                       capture_output=True, timeout=1).stdout.strip()
+                if value and not value.startswith('127.'):
+                    return value
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(('192.0.2.1', 80))  # local route selection; sends no packets
+            value = sock.getsockname()[0]
+            return value if value and not value.startswith('127.') else None
+    except OSError:
+        return None
+
+
+def print_urls():
+    log('Local   ' + color(URL, 'ok'), 'ok')
+    addr = local_ip()
+    if addr and BIND not in ('127.0.0.1', 'localhost', '::1'):
+        scheme = URL.split(':',1)[0]
+        log('Network ' + color(f'{scheme}://{addr}:{PORT}', 'ok'), 'ok')
+    elif BIND in ('127.0.0.1', 'localhost', '::1'):
+        log('Network access disabled: set SPLAR_BIND=0.0.0.0', 'warn')
+    else:
+        log('Network IP not detected; check your Mac LAN address', 'warn')
 
 
 def notice(key, message, seconds=35):
     if time.time() - last_notice.get(key, 0) >= seconds:
-        log(message)
+        log(message, 'error' if key.startswith(('error','loop','flask','startup')) else 'warn')
         last_notice[key] = time.time()
 
 
@@ -121,23 +164,25 @@ def git(*args, check=False):
                           timeout=60, check=check)
 
 
-def health():
+def health(base_url=None):
+    url = base_url or URL
     try:
-        context = ssl._create_unverified_context() if URL.startswith('https:') else None
-        with urllib.request.urlopen(URL + '/api/health', timeout=1.7, context=context) as r:
+        context = ssl._create_unverified_context() if url.startswith('https:') else None
+        with urllib.request.urlopen(url + '/api/health', timeout=1.7, context=context) as r:
             body = json.load(r)
         return body.get('database') == 'SQLite' and 'VGGT' in body.get('engine', '')
     except Exception:
         return False
 
 
-def busy():
+def busy(base_url=None):
     """Avoid killing Flask while it is reconstructing a room."""
-    if not health():
+    url = base_url or URL
+    if not health(url):
         return False
     try:
-        context = ssl._create_unverified_context() if URL.startswith('https:') else None
-        with urllib.request.urlopen(URL + '/api/scenes', timeout=3, context=context) as r:
+        context = ssl._create_unverified_context() if url.startswith('https:') else None
+        with urllib.request.urlopen(url + '/api/scenes', timeout=3, context=context) as r:
             scenes = json.load(r)
         return any(item.get('status') == 'processing' for item in scenes)
     except Exception:
@@ -157,10 +202,10 @@ def process_alive(pid):
     return status.returncode == 0 and not status.stdout.lstrip().startswith('Z')
 
 
-def listening_pids():
+def listening_pids(port=None):
     if not shutil.which('lsof'):
         return []
-    result = subprocess.run(['lsof', '-nP', '-t', f'-iTCP:{PORT}', '-sTCP:LISTEN'],
+    result = subprocess.run(['lsof', '-nP', '-t', f'-iTCP:{port or PORT}', '-sTCP:LISTEN'],
                             capture_output=True, text=True)
     return sorted({int(v) for v in result.stdout.split() if v.isdigit()})
 
@@ -172,16 +217,18 @@ def recorded_pid():
         return None
 
 
-def stop_server():
-    pids = listening_pids()
+def stop_server(port=None):
+    port = port or PORT
+    pids = listening_pids(port)
     own_pid = recorded_pid()
     if own_pid and process_alive(own_pid) and own_pid not in pids:
+        # The tracked process may belong to the old listener when migrating ports.
         pids.append(own_pid)
     # Do not terminate another app occupying the port.
     for pid in pids:
         command = pid_command(pid)
         if command and 'splar.py' not in command:
-            raise RuntimeError(f'Port {PORT} belongs to another process ({pid}: {command})')
+            raise RuntimeError(f'Port {port} belongs to another process ({pid}: {command})')
     for pid in pids:
         if process_alive(pid):
             log(f'Stopping Flask process {pid}')
@@ -215,6 +262,8 @@ def start_server():
         raise RuntimeError('A tracked Flask process is still running but not responding')
     py = python_interpreter()
     env = dict(os.environ)
+    env['SPLAR_PORT'] = str(PORT)
+    env['SPLAR_BIND'] = BIND
     env.setdefault('HF_HUB_DISABLE_XET', '1')
     env.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
     env.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
@@ -224,16 +273,47 @@ def start_server():
                                 stdout=output, stderr=subprocess.STDOUT,
                                 start_new_session=True)
     PID_FILE.write_text(f'{proc.pid}\n')
-    log(f'Starting existing Python environment (PID {proc.pid}, port {PORT})')
+    log(f'Starting existing Python environment (PID {proc.pid}, port {PORT}, bind {BIND})', 'deploy')
     until = time.monotonic() + 35
     while time.monotonic() < until:
         if health():
-            log(f'Flask ready: {URL}')
+            log(f'Flask ready: {URL}', 'ok')
+            print_urls()
             return
         if proc.poll() is not None:
             raise RuntimeError(f'Flask exited with status {proc.returncode}; inspect {LOG_FILE}')
         time.sleep(.5)
     raise RuntimeError(f'Flask health check timed out; inspect {LOG_FILE}')
+
+
+def migrate_legacy_port():
+    """Retire the old tracked 5050 SPLAR server before starting on 5463."""
+    if PORT == 5050:
+        return True
+    legacy_url = 'http://127.0.0.1:5050'
+    old_pid = recorded_pid()
+    old_listener_pids = listening_pids(5050)
+    if old_pid and process_alive(old_pid) and old_pid not in old_listener_pids:
+        # When lsof is unavailable, only consider the tracked PID a legacy server
+        # if port 5050 responds as SPLAR (never confuse the new 5463 server).
+        if health(legacy_url) and 'splar.py' in pid_command(old_pid):
+            old_listener_pids.append(old_pid)
+    if not old_listener_pids:
+        return True
+    for pid in old_listener_pids:
+        command = pid_command(pid)
+        if 'splar.py' not in command:
+            log(f'Port 5050 in use by another app (PID {pid}); leaving it untouched', 'warn')
+            return True
+    if not health(legacy_url):
+        log('Existing 5050 process did not respond to SPLAR health check; leaving it untouched', 'warn')
+        return True
+    if busy(legacy_url):
+        notice('migration', 'Reconstruction still running on 5050; defer migration to 5463')
+        return False
+    log('Moving existing SPLAR server from 5050 to 5463', 'deploy')
+    stop_server(5050)
+    return True
 
 
 def restart():
@@ -242,6 +322,8 @@ def restart():
 
 
 def apply_release(path, archive_hash, version, code):
+    if not migrate_legacy_port():
+        return False
     if busy():
         notice('busy', f'Room reconstruction active; deferring update {version}')
         return False
@@ -252,13 +334,13 @@ def apply_release(path, archive_hash, version, code):
     (backup_dir / 'splar.py').write_bytes(original_code)
     if previous_version is not None:
         (backup_dir / 'VERSION').write_bytes(previous_version)
-    log(f'Applying v{version} (backup: {backup_dir.relative_to(ROOT)})')
+    log(f'Applying v{version} (backup: {backup_dir.relative_to(ROOT)})', 'deploy')
     try:
         atomic_bytes(CORE / 'splar.py', code)
         atomic_bytes(VERSION_FILE, (version + '\n').encode())
         restart()
     except Exception as exc:
-        log(f'Update failed ({exc}); restoring old application')
+        log(f'Update failed ({exc}); restoring old application', 'error')
         atomic_bytes(CORE / 'splar.py', original_code)
         if previous_version is None:
             VERSION_FILE.unlink(missing_ok=True)
@@ -270,7 +352,7 @@ def apply_release(path, archive_hash, version, code):
             log(f'Rollback server restart failed: {rollback_error}')
         raise
     write_json(PENDING_FILE, {'version': version, 'archive': path.name, 'sha256': archive_hash})
-    log(f'v{version} deployed locally; Python packages, model weights and splar_data untouched')
+    log(f'v{version} deployed locally; Python packages, model weights and splar_data untouched', 'ok')
     return True
 
 
@@ -321,7 +403,7 @@ def publish(pending):
     if push.returncode:
         notice('push', f'Git push pending: {push.stderr.strip()}')
         return False
-    log(f'Pushed v{version} to origin/{branch.stdout.strip()}')
+    log(f'Pushed v{version} to origin/{branch.stdout.strip()}', 'ok')
     return True
 
 
@@ -388,11 +470,14 @@ def main():
     version_tuple(current_version())
     if not VERSION_FILE.exists():
         atomic_bytes(VERSION_FILE, b'0.1.0\n')
-    log(f'Watching {UPDATES} | current v{current_version()} | interval {POLL}s')
-    log('The watcher NEVER runs pip or deletes .venv / Hugging Face cache / splar_data')
+    log(f'Watching {UPDATES} | current v{current_version()} | interval {POLL}s', 'deploy')
+    log('No pip reinstalls, model redownloads or SQLite changes')
     try:
-        if not health():
-            start_server()
+        if migrate_legacy_port():
+            if not health():
+                start_server()
+            else:
+                print_urls()
     except Exception as exc:
         notice('startup', f'Flask startup: {exc}')
     stability = {}
@@ -401,6 +486,14 @@ def main():
             stability[archive.name] = (archive.stat().st_size, archive.stat().st_mtime_ns)
     while True:
         try:
+            if not ONCE:
+                print()  # A blank line separates each refresh in the terminal.
+                log(f'Refresh • v{current_version()} • checking updates', 'scan')
+            if not migrate_legacy_port():
+                if ONCE:
+                    return
+                time.sleep(POLL)
+                continue
             if not health():
                 own_pid = recorded_pid()
                 if not own_pid or not process_alive(own_pid):

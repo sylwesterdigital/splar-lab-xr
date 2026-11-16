@@ -625,7 +625,7 @@ INDEX_HTML = r'''<!doctype html>
  <span class="bar-sep"></span><button class="toolbtn" id="fitButton"><svg class="ico" viewBox="0 0 24 24"><path d="M8 3H3v5m18 0V3h-5M3 16v5h5m8 0h5v-5"/></svg>Fit</button>
  <span class="bar-sep"></span><button class="toolbtn" id="xrButton" disabled title="Requires a WebXR-compatible headset and secure context"><svg class="ico" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="11" rx="4"/><path d="M7 12h3m4 0h3"/></svg><span id="xrLabel">XR</span></button>
 </div>
-<div class="foot-note">SPLAR / LOCAL-FIRST SPATIAL WORKSPACE · <span id="appVersion">v0.2.0</span></div>
+<div class="foot-note">SPLAR / LOCAL-FIRST SPATIAL WORKSPACE · <span id="appVersion">v0.3.0</span></div>
 <div id="toast" role="status"></div>
 <div class="modal-backdrop" id="galleryModal" role="dialog" aria-modal="true" aria-label="Room gallery"><div class="modal"><div class="modal-top"><div><div class="modal-title">Your spaces<span style="color:var(--accent)">.</span></div><div class="modal-sub">Stored locally · SQLite</div></div><button class="modal-close" id="closeGallery" aria-label="Close gallery">×</button></div><div class="gallery" id="galleryGrid"></div></div></div>
 <script>
@@ -828,13 +828,13 @@ init();
 if __name__ == '__main__':
     init_db()
     make_demo()
-    host = os.environ.get('SPLAR_BIND', '127.0.0.1')
-    port = int(os.environ.get('SPLAR_PORT', '5050'))
+    host = os.environ.get('SPLAR_BIND', '0.0.0.0')
+    port = int(os.environ.get('SPLAR_PORT', '5463'))
     ssl_context = None
     if os.environ.get('SPLAR_CERT') and os.environ.get('SPLAR_KEY'):
         ssl_context = (os.environ['SPLAR_CERT'], os.environ['SPLAR_KEY'])
     elif os.environ.get('SPLAR_HTTPS') == '1':
         ssl_context = 'adhoc'  # development only; use a trusted certificate for headset access.
     protocol = 'https' if ssl_context else 'http'
-    print(f'\n  SPLAR  /  {protocol}://{host}:{port}  /  SQLite: {DATABASE}\n', flush=True)
+    print(f'\n  SPLAR  /  {protocol}://127.0.0.1:{port} (bind {host})  /  SQLite: {DATABASE}\n', flush=True)
     app.run(host=host, port=port, debug=False, threaded=True, ssl_context=ssl_context)
